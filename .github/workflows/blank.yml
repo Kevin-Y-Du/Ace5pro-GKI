@@ -17,10 +17,6 @@ on:
         description: '设备代号'
         default: 'oneplus_ace5_pro'
         required: false
-      CPUD:
-        description: 'CPU 代号'
-        default: 'sun'
-        required: false
       ANDROID_VERSION:
         description: 'Android 版本'
         default: 'android15'
@@ -48,7 +44,6 @@ jobs:
           echo "CCACHE_HARDLINK=true" >> $GITHUB_ENV
           echo "CPU=${{ github.event.inputs.CPU || 'sm8750' }}" >> $GITHUB_ENV
           echo "FEIL=${{ github.event.inputs.FEIL || 'oneplus_ace5_pro' }}" >> $GITHUB_ENV
-          echo "CPUD=${{ github.event.inputs.CPUD || 'sun' }}" >> $GITHUB_ENV
           echo "ANDROID_VERSION=${{ github.event.inputs.ANDROID_VERSION || 'android15' }}" >> $GITHUB_ENV
           echo "KERNEL_VERSION=${{ github.event.inputs.KERNEL_VERSION || '6.6' }}" >> $GITHUB_ENV
           echo "KERNEL_NAME=${{ github.event.inputs.KERNEL_NAME || '-android15-8-g013ec21bba94-abogki383916444@DUGH' }}" >> $GITHUB_ENV
@@ -58,43 +53,32 @@ jobs:
       - name: 安装系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 git curl ccache gcc flex bison libssl-dev libelf-dev zip
-          sudo apt-get install -y apt-transport-https curl gnupg
-          curl -fsSL https://bazel.build/bazel-release.pub.gpg | gpg --dearmor > bazel.gpg
-          sudo mv bazel.gpg /etc/apt/trusted.gpg.d/
+          sudo apt-get install -y python3 git curl ccache gcc flex bison libssl-dev libelf-dev zip openjdk-11-jdk
+          curl -fsSL https://bazel.build/bazel-release.pub.gpg | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/bazel.gpg
           echo "deb [arch=amd64] https://storage.googleapis.com/bazel-apt stable jdk1.8" | sudo tee /etc/apt/sources.list.d/bazel.list
           sudo apt-get update
           sudo apt-get install -y bazel
+          bazel --version
 
       - name: 安装 repo 工具
         run: |
-          if [ ! -f "/usr/local/bin/repo" ]; then
-            for attempt in {1..3}; do
-              curl -s --connect-timeout 10 https://storage.googleapis.com/git-repo-downloads/repo > ~/repo && break
-              echo "下载 repo 失败，重试 ($attempt/3)..."
-              sleep 5
-            done
+          if ! command -v repo >/dev/null 2>&1; then
+            curl -s --connect-timeout 10 https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
             if [ ! -f "~/repo" ]; then
               echo "无法下载 repo 工具"
               exit 1
             fi
-            chmod a+x ~/repo
+            chmod +x ~/repo
             sudo mv ~/repo /usr/local/bin/repo
           fi
+          repo --version
 
       - name: 清理系统空间
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/haskell
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/haskell
           sudo apt-get clean
           sudo rm -rf /tmp/*
           df -h
-          mkdir -p $GITHUB_WORKSPACE/work/kernel_platform
-          cd $GITHUB_WORKSPACE/work/kernel_platform
-          tools/bazel clean --expunge || true
-          cd $GITHUB_WORKSPACE
 
       - name: 清理补丁目录
         run: |
@@ -107,81 +91,51 @@ jobs:
 
       - name: 管理内核源码
         run: |
-          if [[ -d "work/.repo" && ! -f "work/.repo/manifest.xml" ]]; then
-            echo "检测到损坏的 .repo 目录，执行强制清理..."
-            rm -rf work/.repo
+          mkdir -p work
+          cd work || exit 1
+          if [ -d ".repo" ] && [ ! -f ".repo/manifest.xml" ]; then
+            echo "检测到损坏的 .repo 目录，清理..."
+            rm -rf .repo
           fi
-          if [ -d "work/.repo" ]; then
-            echo "检测到有效源码仓库，执行智能更新..."
-            cd work || exit 1
-            if [ ! -f ".repo/manifest.xml" ]; then
-              echo "检测到 manifest 丢失，重新初始化..."
-              rm -rf .repo
-              repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
-                -b refs/heads/oneplus/$CPU \
-                -m $FEIL.xml \
-                --depth=1 --repo-url=https://gerrit.googlesource.com/git-repo || exit 1
-            fi
-            if ! repo manifest -v > /dev/null 2>&1; then
-              echo "manifest 验证失败，执行深度修复..."
-              repo init --force -u https://github.com/OnePlusOSS/kernel_manifest.git \
-                -b refs/heads/oneplus/$CPU \
-                -m $FEIL.xml \
-                --depth=1 --repo-url=https://gerrit.googlesource.com/git-repo || exit 1
-            fi
+          if [ -d ".repo" ]; then
+            echo "更新现有源码仓库..."
+            repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/$CPU -m $FEIL.xml --depth=1 || exit 1
             for retry in {1..3}; do
               echo "同步尝试 ($retry/3)..."
               if repo sync -c -j4 --no-tags --force-sync; then
                 echo "同步成功"
                 break
               else
-                echo "同步失败，执行恢复操作..."
+                echo "同步失败，重试..."
                 find .repo -name '*.lock' -delete
                 repo forall -c 'git reset --hard HEAD@{upstream} ; git clean -fdx'
-                sleep $((retry * 5))
+                sleep $((retry * 10))
               fi
             done || exit 1
-            cd ..
           else
             echo "初始化新源码仓库..."
-            mkdir -p work && cd work || exit 1
-            repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
-              -b refs/heads/oneplus/$CPU \
-              -m $FEIL.xml \
-              --depth=1 --repo-url=https://gerrit.googlesource.com/git-repo || exit 1
+            repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/$CPU -m $FEIL.xml --depth=1 || exit 1
             repo sync -c -j4 --no-tags --force-sync || exit 1
-            cd ..
-          fi
-          cd $GITHUB_WORKSPACE/work/kernel_platform
-          if [ -d "KernelSU" ]; then
-            echo "验证 KernelSU 目录结构..."
-            if [ -L "KernelSU/kernel/kernel" ]; then
-              echo "检测到循环符号链接，执行修复..."
-              rm -vf KernelSU/kernel/kernel
-              git checkout -- KernelSU/kernel/
-            fi
           fi
           cd $GITHUB_WORKSPACE
 
       - name: 配置 SukiSU
         run: |
           cd $GITHUB_WORKSPACE/work/kernel_platform || exit 1
-          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev || exit 1
           cd KernelSU || exit 1
           KSU_VERSION=$(expr $(git rev-list --count main) + 10606)
           sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
-          echo "检查符号链接..."
-          find KernelSU/ -type l -exec ls -l {} \; | awk '{if($11 == $9) exit 1}' || exit 1
           cd $GITHUB_WORKSPACE
 
       - name: 配置 SUSFS
         run: |
           cd $GITHUB_WORKSPACE/work || exit 1
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-$ANDROID_VERSION-$KERNEL_VERSION
-          git clone https://github.com/ExmikoN/SukiSU_patch.git
-          cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-$ANDROID_VERSION-$KERNEL_VERSION.patch kernel_platform/common/
-          cp susfs4ksu/kernel_patches/fs/* kernel_platform/common/fs/
-          cp susfs4ksu/kernel_patches/include/linux/* kernel_platform/common/include/linux/
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-$ANDROID_VERSION-$KERNEL_VERSION || exit 1
+          git clone https://github.com/ExmikoN/SukiSU_patch.git || exit 1
+          cp -r susfs4ksu/kernel_patches/50_add_susfs_in_gki-$ANDROID_VERSION-$KERNEL_VERSION.patch kernel_platform/common/
+          cp -r susfs4ksu/kernel_patches/fs/* kernel_platform/common/fs/
+          cp -r susfs4ksu/kernel_patches/include/linux/* kernel_platform/common/include/linux/
           cp -r SukiSU_patch/other/lz4k/include/linux/* kernel_platform/common/include/linux
           cp -r SukiSU_patch/other/lz4k/lib/* kernel_platform/common/lib
           cp -r SukiSU_patch/other/lz4k/crypto/* kernel_platform/common/crypto
@@ -220,7 +174,7 @@ CONFIG_CRYPTO_LZ4KD=y
 CONFIG_CRYPTO_842=y
 EOT
           sed -i 's/check_defconfig//' build.config.gki
-          git add -A && git commit -a -m "BUILD Kernel"
+          git add -A && git commit -a -m "BUILD Kernel" || true
           cd $GITHUB_WORKSPACE
 
       - name: 设置内核名称
@@ -230,39 +184,37 @@ EOT
             echo "目录不存在: common/scripts"
             exit 1
           fi
-          sed -i 's/res="\$res\$(cat "\$file")"/res="'$KERNEL_NAME'"/g' common/scripts/setlocalversion
+          sed -i "s/res=\"\$res\$(cat \"\$file\")\"/res=\"$KERNEL_NAME\"/g" common/scripts/setlocalversion
           cd $GITHUB_WORKSPACE
 
       - name: 构建内核
         run: |
           cd $GITHUB_WORKSPACE/work/kernel_platform || exit 1
-          find kernel_platform/ -type l -name "kernel" -delete
-          find kernel_platform/ -type d -empty -delete
           if [ ! -d "tools" ]; then
             echo "目录不存在: tools"
             exit 1
           fi
-          tools/bazel run --config=fast --config=stamp --lto=thin //common:kernel_aarch64_dist -- --dist_dir=dist
+          tools/bazel run --config=fast --config=stamp --lto=thin //common:kernel_aarch64_dist -- --dist_dir=dist || exit 1
 
       - name: 打包 AnyKernel3
         run: |
           cd $GITHUB_WORKSPACE/work/kernel_platform/dist || exit 1
           if [ "$FEIL" = "oneplus_ace5_pro" ]; then
-            git clone -b a5p https://github.com/aa123330/AnyKernel3.git --depth=1
+            git clone -b a5p https://github.com/aa123330/AnyKernel3.git --depth=1 || exit 1
           else
-            git clone https://github.com/aa123330/AnyKernel3.git --depth=1
+            git clone https://github.com/aa123330/AnyKernel3.git --depth=1 || exit 1
           fi
           rm -rf AnyKernel3/.git AnyKernel3/push.sh
           cp Image AnyKernel3/
           cd AnyKernel3 || exit 1
           cp $GITHUB_WORKSPACE/work/SukiSU_patch/kpm/patch_linux ./
           chmod 777 patch_linux
-          ./patch_linux
+          ./patch_linux || exit 1
           rm -rf Image && mv oImage Image
           rm -rf patch_linux
           timestamp=$(date +%Y%m%d%H%M)
           output_zip="SuKiSu_${KSU_VERSION}_${FEIL}_${timestamp}.zip"
-          zip -r "../${output_zip}" *
+          zip -r "../${output_zip}" * || exit 1
           mkdir -p "$OUTPUT_DIR"
           mv "../${output_zip}" "$OUTPUT_DIR/"
           cd $GITHUB_WORKSPACE
